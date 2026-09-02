@@ -3,234 +3,232 @@ package com.example.demo.service;
 import com.example.demo.dto.CreatePaymentRequest;
 import com.example.demo.dto.PaymentResponse;
 import com.example.demo.dto.PaymentWebhookRequest;
+import com.example.demo.exception.IdempotencyConflictException;
+import com.example.demo.exception.InvalidPaymentStateException;
+import com.example.demo.exception.PaymentNotFoundException;
 import com.example.demo.model.Payment;
+import com.example.demo.model.PaymentMethod;
 import com.example.demo.model.PaymentStatus;
 import com.example.demo.model.ProviderResultType;
-import com.example.demo.provider.PaymentProvider;
+import com.example.demo.processor.PaymentProcessor;
 import com.example.demo.provider.ProviderResult;
 import com.example.demo.repository.PaymentRepository;
 
-import lombok.RequiredArgsConstructor;
-
 import java.time.Instant;
-import java.util.Optional;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
 @Service
-@RequiredArgsConstructor
 public class PaymentService {
 
-    private final Set<String> processedWebhookEvents =
-        ConcurrentHashMap.newKeySet();
+        private final PaymentRepository paymentRepository;
 
-    private final PaymentRepository paymentRepository;
-    private final PaymentProvider paymentProvider;
+        private final Map<PaymentMethod, PaymentProcessor> processors;
+        private final Set<String> processedWebhookEvents = ConcurrentHashMap.newKeySet();
 
-    public PaymentResponse createPayment(
-            String idempotencyKey,
-            CreatePaymentRequest request) {
+        public PaymentService(
+                        PaymentRepository paymentRepository,
+                        List<PaymentProcessor> paymentProcessors) {
 
-        Payment existingPayment =
-                paymentRepository
-                        .findByIdempotencyKey(idempotencyKey)
-                        .orElse(null);
-
-        if (existingPayment != null) {
-            validateSameRequest(existingPayment, request);
-
-            return new PaymentResponse(
-                    existingPayment.getId(),
-                    existingPayment.getStatus()
-            );
+                this.paymentRepository = paymentRepository;
+                
+                this.processors = paymentProcessors.stream()
+                                .collect(Collectors.toMap(
+                                                processor -> processor.supportedMethod(),
+                                                processor -> processor));
         }
 
-        Instant now = Instant.now();
+        public PaymentResponse createPayment(
+                        String idempotencyKey,
+                        CreatePaymentRequest request) {
 
-        Payment newPayment = new Payment(
-                "pay_" + UUID.randomUUID(),
-                request.getUserId(),
-                request.getMerchantId(),
-                request.getAmount(),
-                request.getCurrency(),
-                request.getPaymentMethod(),
-                idempotencyKey,
-                PaymentStatus.CREATED,
-                null,
-                0,
-                now,
-                now
-        );
+                Payment existingPayment = paymentRepository
+                                .findByIdempotencyKey(idempotencyKey)
+                                .orElse(null);
 
-        Payment savedPayment =
-                paymentRepository.saveIfAbsent(
-                        idempotencyKey,
-                        newPayment
-                );
+                if (existingPayment != null) {
+                        validateSameRequest(existingPayment, request);
 
-        // Another concurrent request may have won.
-        if (!savedPayment.getId().equals(newPayment.getId())) {
+                        return new PaymentResponse(
+                                        existingPayment.getId(),
+                                        existingPayment.getStatus());
+                }
 
-            validateSameRequest(savedPayment, request);
+                Instant now = Instant.now();
 
-            return new PaymentResponse(
-                    savedPayment.getId(),
-                    savedPayment.getStatus()
-            );
+                Payment newPayment = new Payment(
+                                "pay_" + UUID.randomUUID(),
+                                request.getUserId(),
+                                request.getMerchantId(),
+                                request.getAmount(),
+                                request.getCurrency(),
+                                request.getPaymentMethod(),
+                                idempotencyKey,
+                                PaymentStatus.CREATED,
+                                null,
+                                0,
+                                now,
+                                now);
+
+                Payment savedPayment;
+
+                try {
+                        savedPayment = paymentRepository.saveAndFlush(newPayment);
+
+                } catch (DataIntegrityViolationException ex) {
+
+                        Payment concurrentPayment = paymentRepository
+                                        .findByIdempotencyKey(idempotencyKey)
+                                        .orElseThrow(() -> ex);
+
+                        validateSameRequest(
+                                        concurrentPayment,
+                                        request);
+
+                        return new PaymentResponse(
+                                        concurrentPayment.getId(),
+                                        concurrentPayment.getStatus());
+                }
+
+                PaymentProcessor processor = processors.get(savedPayment.getPaymentMethod());
+
+                if (processor == null) {
+                        throw new IllegalArgumentException(
+                                        "Unsupported payment method: "
+                                                        + savedPayment.getPaymentMethod());
+                }
+
+                ProviderResult providerResult = processor.process(savedPayment);
+                handleProviderResult(
+                                savedPayment,
+                                providerResult);
+
+                return new PaymentResponse(
+                                savedPayment.getId(),
+                                savedPayment.getStatus());
         }
 
-        ProviderResult providerResult =
-                paymentProvider.initiatePayment(savedPayment);
-
-        handleProviderResult(
-                savedPayment,
-                providerResult
-        );
-
-        return new PaymentResponse(
-                savedPayment.getId(),
-                savedPayment.getStatus()
-        );
-    }
-
-    public Payment getPayment(String paymentId) {
-        return paymentRepository
-                .findById(paymentId)
-                .orElseThrow(() ->
-                        new RuntimeException("Payment not found")
-                );
-    }
-
-    public void processWebhook(PaymentWebhookRequest request) {
-
-        if (processedWebhookEvents.contains(request.getEventId())) {
-            return;
+        public Payment getPayment(String paymentId) {
+                return paymentRepository
+                                .findById(paymentId)
+                                .orElseThrow(() -> new PaymentNotFoundException(
+                                                "Payment not found: " + paymentId));
         }
 
-        Payment payment =
-                paymentRepository
-                        .findByProviderPaymentId(
-                                request.getProviderPaymentId()
-                        )
-                        .orElseThrow(() ->
-                                new RuntimeException(
-                                        "Payment not found for provider payment id"
-                                )
-                        );
+        public void processWebhook(PaymentWebhookRequest request) {
 
-        switch (request.getStatus()) {
+                if (processedWebhookEvents.contains(request.getEventId())) {
+                        return;
+                }
 
-            case SUCCESS ->
-                    updatePaymentStatus(
-                            payment,
-                            PaymentStatus.SUCCESS
-                    );
+                Payment payment = paymentRepository
+                                .findByProviderPaymentId(
+                                                request.getProviderPaymentId())
+                                .orElseThrow(() -> new RuntimeException(
+                                                "Payment not found for provider payment id"));
 
-            case FAILED ->
-                    updatePaymentStatus(
-                            payment,
-                            PaymentStatus.FAILED
-                    );
+                switch (request.getStatus()) {
+
+                        case SUCCESS ->
+                                updatePaymentStatus(
+                                                payment,
+                                                PaymentStatus.SUCCESS);
+
+                        case FAILED ->
+                                updatePaymentStatus(
+                                                payment,
+                                                PaymentStatus.FAILED);
+                        default -> throw new IllegalArgumentException("Unexpected value: " + request.getStatus());
+                }
+
+                paymentRepository.save(payment);
+
+                processedWebhookEvents.add(request.getEventId());
         }
 
-        paymentRepository.save(payment);
+        private void updatePaymentStatus(
+                        Payment payment,
+                        PaymentStatus newStatus) {
 
-        processedWebhookEvents.add(request.getEventId());
-    }
+                PaymentStatus currentStatus = payment.getStatus();
 
-    private void updatePaymentStatus(
-        Payment payment,
-        PaymentStatus newStatus) {
+                // Duplicate webhook
+                if (currentStatus == newStatus) {
+                        return;
+                }
 
-        PaymentStatus currentStatus =
-                payment.getStatus();
+                boolean validTransition = currentStatus == PaymentStatus.PROCESSING
+                                &&
+                                (newStatus == PaymentStatus.SUCCESS
+                                                || newStatus == PaymentStatus.FAILED);
 
-        // Duplicate webhook
-        if (currentStatus == newStatus) {
-            return;
+                if (!validTransition) {
+                        throw new InvalidPaymentStateException(
+                                        "Invalid payment state transition: "
+                                                        + currentStatus
+                                                        + " -> "
+                                                        + newStatus);
+                }
+
+                payment.updateStatus(newStatus);
         }
 
-        boolean validTransition =
-                currentStatus == PaymentStatus.PROCESSING
-                        &&
-                (newStatus == PaymentStatus.SUCCESS
-                        || newStatus == PaymentStatus.FAILED);
+        private void validateSameRequest(
+                        Payment existingPayment,
+                        CreatePaymentRequest request) {
 
-        if (!validTransition) {
-            throw new IllegalStateException(
-                    "Invalid payment state transition: "
-                            + currentStatus
-                            + " -> "
-                            + newStatus
-            );
+                boolean sameRequest = existingPayment.getUserId()
+                                .equals(request.getUserId())
+                                &&
+                                existingPayment.getMerchantId()
+                                                .equals(request.getMerchantId())
+                                &&
+                                existingPayment.getAmount() == request.getAmount()
+                                &&
+                                existingPayment.getCurrency()
+                                                .equals(request.getCurrency())
+                                &&
+                                existingPayment.getPaymentMethod() == request.getPaymentMethod();
+
+                if (!sameRequest) {
+                        throw new IdempotencyConflictException(
+                                        "Idempotency key already used for a different request");
+                }
         }
 
-        payment.setStatus(newStatus);
-    }
+        private void handleProviderResult(
+                        Payment payment,
+                        ProviderResult result) {
 
-    private void validateSameRequest(
-        Payment existingPayment,
-        CreatePaymentRequest request) {
+                if (result.getProviderPaymentId() != null) {
+                        payment.setProviderPaymentId(
+                                        result.getProviderPaymentId());
+                }
 
-        boolean sameRequest =
-                existingPayment.getUserId()
-                        .equals(request.getUserId())
-                &&
-                existingPayment.getMerchantId()
-                        .equals(request.getMerchantId())
-                &&
-                existingPayment.getAmount()
-                        == request.getAmount()
-                &&
-                existingPayment.getCurrency()
-                        .equals(request.getCurrency())
-                &&
-                existingPayment.getPaymentMethod()
-                        == request.getPaymentMethod();
+                if (result.getResultType() == ProviderResultType.ACCEPTED) {
 
-        if (!sameRequest) {
-            throw new IllegalArgumentException(
-                    "Idempotency key already used for a different request"
-            );
+                        payment.updateStatus(
+                                        PaymentStatus.PROCESSING);
+
+                } else if (result.getResultType() == ProviderResultType.DEFINITIVE_FAILURE) {
+
+                        payment.updateStatus(
+                                        PaymentStatus.FAILED);
+
+                } else if (result.getResultType() == ProviderResultType.RETRYABLE_FAILURE) {
+
+                        payment.updateStatus(
+                                        PaymentStatus.PROCESSING);
+                }
+
+                paymentRepository.save(payment);
         }
-    }
-
-    private void handleProviderResult(
-        Payment payment,
-        ProviderResult result) {
-
-        if (result.getProviderPaymentId() != null) {
-            payment.setProviderPaymentId(
-                    result.getProviderPaymentId()
-            );
-        }
-
-        if (result.getResultType()
-                == ProviderResultType.ACCEPTED) {
-
-            payment.setStatus(
-                    PaymentStatus.PROCESSING
-            );
-
-        } else if (result.getResultType()
-                == ProviderResultType.DEFINITIVE_FAILURE) {
-
-            payment.setStatus(
-                    PaymentStatus.FAILED
-            );
-
-        } else if (result.getResultType()
-                == ProviderResultType.RETRYABLE_FAILURE) {
-
-            payment.setStatus(
-                    PaymentStatus.PROCESSING
-            );
-        }
-
-        paymentRepository.save(payment);
-    }
 
 }
