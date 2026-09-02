@@ -124,6 +124,7 @@ public class PaymentService {
 
         public void processWebhook(PaymentWebhookRequest request) {
 
+                // Check if the webhook event has already been processed
                 if (processedWebhookEvents.contains(request.getEventId())) {
                         return;
                 }
